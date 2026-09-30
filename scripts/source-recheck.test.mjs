@@ -62,9 +62,9 @@ test("verification staleness is UTC-based and actionable only when older than 90
 });
 
 test("HTTP classes keep restricted and transient results non-actionable, and require two hard failures", () => {
-  for (const status of [200, 204, 301, 399]) assert.equal(classifyHttpStatus(status), "healthy");
+  for (const status of [200, 204]) assert.equal(classifyHttpStatus(status), "healthy");
   for (const status of [401, 403]) assert.equal(classifyHttpStatus(status), "restricted");
-  for (const status of [408, 416, 425, 429, 500, 503]) assert.equal(classifyHttpStatus(status), "inconclusive");
+  for (const status of [301, 399, 408, 416, 425]) assert.equal(classifyHttpStatus(status), "inconclusive");
   assert.equal(classifyAttemptPair({ classification: "hard-broken" }, { classification: "hard-broken" }), "broken");
   assert.equal(classifyAttemptPair({ classification: "hard-broken" }, { classification: "healthy" }), "inconclusive");
   assert.equal(classifyAttemptPair({ classification: "hard-broken" }, { classification: "inconclusive" }), "inconclusive");
@@ -94,11 +94,11 @@ test("network safety blocks local names, direct IPs, and private DNS answers", a
   assert.equal((await validatePublicRequestUrl("https://example.com/", { lookupImpl: publicDns })).ok, true);
 });
 
-test("declared URL checking uses private headers, safe redirects, and bounded confirmation retries", async () => {
+test("declared URL checking uses private headers, safe redirects, and exactly one observation", async () => {
   const requests = [];
   const sequence = [response(301, "/next"), response(200)];
   const healthy = await checkDeclaredUrl({ url: "https://example.com/start", kinds: ["docs"] }, { lookupImpl: publicDns, fetchImpl: async (url, options) => { requests.push({ url, options }); return sequence.shift(); } });
-  assert.equal(healthy.classification, "healthy");
+  assert.equal(healthy.classification, "redirect");
   assert.equal(healthy.finalUrl, "https://example.com/next");
   assert.equal(requests[0].options.method, "GET");
   assert.equal(requests[0].options.redirect, "manual");
@@ -107,17 +107,17 @@ test("declared URL checking uses private headers, safe redirects, and bounded co
   assert.equal(requests[0].options.headers["User-Agent"], "AI-Dekrov-Source-Recheck/1.0");
   assert.equal(requests[0].options.headers.Range, "bytes=0-4095");
   const broken = await checkDeclaredUrl({ url: "https://example.com/missing", kinds: ["source"] }, { lookupImpl: publicDns, fetchImpl: async () => response(404) });
-  assert.equal(broken.classification, "broken");
+  assert.equal(broken.classification, "hard-broken");
   const gone = await checkDeclaredUrl({ url: "https://example.com/gone", kinds: ["source"] }, { lookupImpl: publicDns, fetchImpl: async () => response(410) });
-  assert.equal(gone.classification, "broken");
+  assert.equal(gone.classification, "hard-broken");
   const mixed = [response(404), response(410)];
-  assert.equal((await checkDeclaredUrl({ url: "https://example.com/mixed", kinds: ["source"] }, { lookupImpl: publicDns, fetchImpl: async () => mixed.shift() })).classification, "broken");
+  assert.equal((await checkDeclaredUrl({ url: "https://example.com/mixed", kinds: ["source"] }, { lookupImpl: publicDns, fetchImpl: async () => mixed.shift() })).classification, "hard-broken");
   const recoveredResponses = [response(404), response(200)];
   const recovered = await checkDeclaredUrl({ url: "https://example.com/flaky", kinds: ["source"] }, { lookupImpl: publicDns, fetchImpl: async () => recoveredResponses.shift() });
-  assert.equal(recovered.classification, "inconclusive");
-  assert.deepEqual(recovered.attempts.map((attempt) => attempt.status), [404, 200]);
+  assert.equal(recovered.classification, "hard-broken");
+  assert.deepEqual(recovered.attempts.map((attempt) => attempt.status), [404]);
   const timedOut = [response(404), new Error("timeout")];
-  assert.equal((await checkDeclaredUrl({ url: "https://example.com/timeout", kinds: ["source"] }, { lookupImpl: publicDns, fetchImpl: async () => { const value = timedOut.shift(); if (value instanceof Error) throw value; return value; } })).classification, "inconclusive");
+  assert.equal((await checkDeclaredUrl({ url: "https://example.com/timeout", kinds: ["source"] }, { lookupImpl: publicDns, fetchImpl: async () => { const value = timedOut.shift(); if (value instanceof Error) throw value; return value; } })).classification, "hard-broken");
 });
 
 test("redirect loops, missing locations, and unsafe redirect targets stay inconclusive or unsafe", async () => {
@@ -128,7 +128,7 @@ test("redirect loops, missing locations, and unsafe redirect targets stay inconc
   const unsafe = await checkDeclaredUrl({ url: "https://example.com/to-local" }, { lookupImpl: publicDns, fetchImpl: async () => response(302, "http://localhost/secret") });
   assert.equal(unsafe.classification, "unsafe");
   const absolute = [response(301, "https://docs.example.com/guide"), response(200)];
-  assert.equal((await checkDeclaredUrl({ url: "https://example.com/docs" }, { lookupImpl: publicDns, fetchImpl: async () => absolute.shift() })).classification, "healthy");
+  assert.equal((await checkDeclaredUrl({ url: "https://example.com/docs" }, { lookupImpl: publicDns, fetchImpl: async () => absolute.shift() })).classification, "redirect");
   const privateRedirect = await checkDeclaredUrl({ url: "https://example.com/private" }, { lookupImpl: async (host) => host === "private.example" ? [{ address: "10.0.0.1", family: 4 }] : [{ address: "93.184.216.34", family: 4 }], fetchImpl: async () => response(302, "https://private.example/") });
   assert.equal(privateRedirect.classification, "unsafe");
   assert.ok(MAX_REDIRECTS <= 5);
@@ -203,11 +203,17 @@ test("GitHub Issue API failures surface and never belong to external-source requ
 
 test("source recheck workflow is scheduled, dispatchable, least-privilege, and isolated from existing Issue automations", () => {
   const workflow = readFileSync(new URL("../.github/workflows/source-recheck.yml", import.meta.url), "utf8");
-  assert.ok(workflow.includes('cron: "17 5 * * 1"'));
+  assert.ok(workflow.includes('cron: "17 */6 * * *"'));
   assert.ok(workflow.includes("workflow_dispatch"));
   assert.ok(workflow.includes("tool_id"));
   assert.ok(workflow.includes('--tool "$TOOL_ID"'));
   assert.ok(workflow.includes("contents: read"));
+  assert.ok(workflow.includes("actions: read"));
+  assert.ok(workflow.includes("cancel-in-progress: false"));
+  assert.ok(workflow.includes("github.ref_name == github.event.repository.default_branch"));
+  assert.ok(workflow.includes("workflow_id: 'source-recheck.yml'"));
+  assert.ok(workflow.includes("source-recheck-state-v1"));
+  assert.ok(workflow.includes("source-recheck-report-v2"));
   assert.ok(workflow.includes("issues: write"));
   for (const forbidden of ["contents: write", "pull-requests: write", "git push", "gh pr create", "apply-submission", "enrich-submission", "tool-submission", "install-failure", "needs-info", "ai-enrich"]) assert.equal(workflow.includes(forbidden), false, forbidden);
   assert.ok(workflow.includes("ensure-labels.mjs"));

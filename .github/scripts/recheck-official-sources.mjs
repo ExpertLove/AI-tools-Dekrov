@@ -5,10 +5,12 @@ import { lookup as dnsLookup } from "node:dns/promises";
 import { parseSetupRecipes, emptySetupRecipes } from "../../assets/js/setup-recipes.js";
 import {
   CHECK_CONCURRENCY, MAX_REDIRECTS, REQUEST_TIMEOUT_MS, STALE_AFTER_DAYS,
-  actionableFindingsForTool, canonicalCheckUrl, classifyAttemptPair,
+  actionableFindingsForTool, canonicalCheckUrl,
   classifyHttpStatus, collectToolCheckTargets, isBlockedHostname, isHttpUrl,
   isIpLiteral, isPrivateAddress, isRedirectStatus
 } from "./source-recheck-lib.mjs";
+
+import { advanceUrl, parseState, MIN_CONFIRMATION_MS } from "./source-recheck-state.mjs";
 
 export const SOURCE_RECHECK_HEADERS = Object.freeze({
   "User-Agent": "AI-Dekrov-Source-Recheck/1.0",
@@ -42,8 +44,8 @@ export async function validatePublicRequestUrl(value, { lookupImpl = dnsLookup }
   if (isIpLiteral(hostname)) return { ok: false, classification: "unsafe", reason: "Direct IP-literal URLs are blocked." };
   if (isBlockedHostname(hostname)) return { ok: false, classification: "unsafe", reason: "Local/private hostname is blocked." };
   let records;
-  try { records = await lookupImpl(hostname, { all: true, verbatim: true }); } catch { return { ok: false, classification: "inconclusive", reason: "DNS lookup failed." }; }
-  if (!Array.isArray(records) || records.length === 0) return { ok: false, classification: "inconclusive", reason: "DNS lookup returned no addresses." };
+  try { records = await lookupImpl(hostname, { all: true, verbatim: true }); } catch { return { ok: false, classification: "dns", reason: "DNS lookup failed." }; }
+  if (!Array.isArray(records) || records.length === 0) return { ok: false, classification: "dns", reason: "DNS lookup returned no addresses." };
   if (records.some((record) => isPrivateAddress(record?.address))) return { ok: false, classification: "unsafe", reason: "Hostname resolves to a private/local address." };
   return { ok: true, url: canonical };
 }
@@ -54,6 +56,7 @@ export async function checkOnce(originalUrl, options = {}) {
   const maxRedirects = options.maxRedirects ?? MAX_REDIRECTS;
   let current = originalUrl;
   let redirects = 0;
+  const redirectChain = options.redirectChain || [];
   while (true) {
     const safe = await validatePublicRequestUrl(current, options);
     if (!safe.ok) return { classification: safe.classification, finalUrl: current, redirects, status: null, reason: safe.reason };
@@ -64,34 +67,43 @@ export async function checkOnce(originalUrl, options = {}) {
       response = await fetchImpl(safe.url, { method: "GET", headers: SOURCE_RECHECK_HEADERS, redirect: "manual", signal: controller.signal });
     } catch (error) {
       clearTimeout(timer);
-      return { classification: "inconclusive", finalUrl: safe.url, redirects, status: null, reason: controller.signal.aborted ? "Request timed out." : `Network request failed: ${error?.name || "unknown error"}.` };
+      return { classification: controller.signal.aborted ? "timeout" : "network-tls", finalUrl: safe.url, redirects, status: null, reason: controller.signal.aborted ? "Request timed out." : `Network request failed: ${error?.name || "unknown error"}.` };
     }
     clearTimeout(timer);
     const status = response.status;
     const location = response.headers?.get?.("location") || "";
     await discard(response);
-    if (!isRedirectStatus(status)) return { classification: classifyHttpStatus(status), finalUrl: safe.url, redirects, status, reason: "" };
+    if (!isRedirectStatus(status)) return { classification: status >= 200 && status < 300 && redirects ? "redirect" : classifyHttpStatus(status), finalUrl: safe.url, redirects, status, reason: "" };
     if (!location) return { classification: "inconclusive", finalUrl: safe.url, redirects, status, reason: "Redirect response had no Location header." };
     if (redirects >= maxRedirects) return { classification: "inconclusive", finalUrl: safe.url, redirects, status, reason: "Redirect limit exceeded." };
     try { current = new URL(location, safe.url).href; } catch { return { classification: "inconclusive", finalUrl: safe.url, redirects, status, reason: "Redirect target is invalid." }; }
+    redirectChain.push({ from: safe.url, to: current, status });
     redirects += 1;
   }
 }
 
 export async function checkDeclaredUrl(target, options = {}) {
-  const first = await checkOnce(target.url, options);
-  const second = first.classification === "hard-broken" ? await checkOnce(target.url, options) : null;
-  const classification = classifyAttemptPair(first, second);
-  const final = second || first;
+  const redirectChain = [];
+  const final = await checkOnce(target.url, { ...options, redirectChain });
+  const classification = final.classification;
+  let github = null;
+  const match = target.url.match(/^https:\/\/github\.com\/([^/?#]+)\/([^/?#]+)(\/[^?#]*)?/);
+  if (match && classification === "hard-broken") {
+    const repositoryUrl = `https://github.com/${match[1]}/${match[2]}`;
+    const repo = match[3] && match[3] !== "/" ? await checkOnce(repositoryUrl, options) : final;
+    github = { repositoryUrl, status: repo.status, classification: ["healthy", "redirect"].includes(repo.classification) ? "repository reachable, target path missing" : repo.classification === "hard-broken" ? "repository not publicly reachable" : "inconclusive" };
+  }
   return {
     ...target,
     originalUrl: target.url,
     finalUrl: final.finalUrl,
     finalStatus: final.status,
     redirects: final.redirects,
-    attempts: [first, ...(second ? [second] : [])].map(({ status, classification: attemptClassification, finalUrl }) => ({ status, classification: attemptClassification, finalUrl })),
+    redirectChain,
+    attempts: [final],
+    github,
     classification,
-    reason: classification === "unsafe" ? (first.reason || second?.reason || "") : classification === "inconclusive" ? (second?.reason || first.reason || "") : ""
+    reason: final.reason
   };
 }
 
@@ -110,29 +122,50 @@ export async function mapBounded(values, limit, work) {
   return results;
 }
 
-export async function buildSourceRecheckReport({ tools, setupRecipes = emptySetupRecipes(), toolId = "", now = new Date(), check = checkDeclaredUrl, concurrency = CHECK_CONCURRENCY } = {}) {
+export async function buildSourceRecheckReport({ tools, setupRecipes = emptySetupRecipes(), toolId = "", now = new Date(), check = checkDeclaredUrl, concurrency = CHECK_CONCURRENCY, state: inputState, event = "workflow_dispatch", runId = "local" } = {}) {
   if (!Array.isArray(tools)) throw new Error("data/tools.json must contain an array.");
   const selectedId = clean(toolId);
   const selected = selectedId ? tools.filter((tool) => tool?.id === selectedId) : tools;
   if (selectedId && selected.length !== 1) throw new Error(`Unknown tool_id: ${selectedId}. Use an exact catalog tool ID.`);
   const orderedTools = [...selected].sort((a, b) => clean(a?.id).localeCompare(clean(b?.id)));
   const work = orderedTools.flatMap((tool) => collectToolCheckTargets(tool, setupRecipes?.tools?.[tool.id] || {}).map((target) => ({ toolId: tool.id, target })));
-  const checked = await mapBounded(work, concurrency, ({ target }) => check(target));
+  const state = parseState(inputState);
+  const unique = [...new Map(work.map(({ target }) => [target.url, target])).values()];
+  const observations = await mapBounded(unique, concurrency, async (target) => {
+    const result = await check(target);
+    result.originalUrl ||= target.url;
+    result.finalUrl ||= target.url;
+    result.state = advanceUrl(state.urls[target.url], result, { now, event, runId });
+    return result;
+  });
+  const byUrl = new Map(observations.map((result) => [result.originalUrl, result]));
+  const checked = work.map(({ target }) => ({ ...byUrl.get(target.url), ...target }));
+  for (const result of observations) state.urls[result.originalUrl] = result.state;
+  if (!selectedId) state.urls = Object.fromEntries(observations.map((result) => [result.originalUrl, result.state]));
   const checksByTool = new Map(orderedTools.map((tool) => [tool.id, []]));
   checked.forEach((result, index) => checksByTool.get(work[index].toolId).push(result));
   const reportTools = orderedTools.map((tool) => {
     const result = { id: tool.id, name: tool.name, lastVerifiedAt: typeof tool.lastVerifiedAt === "string" ? tool.lastVerifiedAt : "", checks: checksByTool.get(tool.id) || [] };
     result.actionable = actionableFindingsForTool(result, now);
+    result.safeToClose = result.checks.every((check) => ["healthy", "redirect"].includes(check.classification));
     return result;
   });
-  const counts = { healthy: 0, restricted: 0, broken: 0, inconclusive: 0, unsafe: 0 };
-  for (const tool of reportTools) for (const checkResult of tool.checks) if (Object.hasOwn(counts, checkResult.classification)) counts[checkResult.classification] += 1;
+  const counts = { healthy: 0, redirect: 0, restricted: 0, broken: 0, suspect: 0, "hard-broken": 0, "rate-limited": 0, timeout: 0, dns: 0, "network-tls": 0, "server-error": 0, inconclusive: 0, unsafe: 0 };
+  for (const checkResult of observations) {
+    if (Object.hasOwn(counts, checkResult.classification)) counts[checkResult.classification] += 1;
+    if (checkResult.state.phase === "confirmed-broken") counts.broken += 1;
+    if (checkResult.state.phase === "suspect") counts.suspect += 1;
+  }
   const staleTools = reportTools.filter((tool) => tool.actionable.some((finding) => finding.type === "verification")).length;
   return {
+    schemaVersion: 2,
+    run: { event, runId },
+    state,
+    findings: reportTools.flatMap((tool) => tool.actionable),
     checkedAt: now.toISOString(),
-    policy: { staleAfterDays: STALE_AFTER_DAYS, timeoutMs: REQUEST_TIMEOUT_MS, concurrency: CHECK_CONCURRENCY, maxRedirects: MAX_REDIRECTS },
+    policy: { minConfirmationMs: MIN_CONFIRMATION_MS, staleAfterDays: STALE_AFTER_DAYS, timeoutMs: REQUEST_TIMEOUT_MS, concurrency, maxRedirects: MAX_REDIRECTS },
     toolsChecked: reportTools.length,
-    urlsChecked: checked.length,
+    urlsChecked: observations.length,
     tools: reportTools,
     summary: { ...counts, staleTools, actionableTools: reportTools.filter((tool) => tool.actionable.length > 0).length }
   };
@@ -155,7 +188,11 @@ export async function runCli(argv = process.argv.slice(2)) {
   const tools = JSON.parse(await readFile(path.join(root, "data/tools.json"), "utf8"));
   const knownIds = new Set(Array.isArray(tools) ? tools.map((tool) => tool.id) : []);
   const setupRecipes = await loadSetupRecipes(path.join(root, "data/setup-recipes.json"), knownIds);
-  const report = await buildSourceRecheckReport({ tools, setupRecipes, toolId: args.tool || "" });
+  let state;
+  try { state = parseState(await readFile(args.state, "utf8")); } catch { state = parseState(null); }
+  const report = await buildSourceRecheckReport({ tools, setupRecipes, toolId: args.tool || "", state, event: process.env.GITHUB_EVENT_NAME || "workflow_dispatch", runId: process.env.GITHUB_RUN_ID || "local" });
+  if (args["state-output"]) await writeFile(args["state-output"], JSON.stringify(report.state, null, 2));
+  delete report.state;
   await writeFile(args.output, JSON.stringify(report, null, 2));
   return report;
 }

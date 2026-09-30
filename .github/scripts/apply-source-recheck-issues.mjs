@@ -29,8 +29,14 @@ export async function applySourceRecheckIssues(report, { repo, token, fetchImpl 
     if (batch.length < 100) break;
   }
   const plan = planSourceRecheckIssues(report, openIssues);
-  const result = { created: 0, updated: 0, unchanged: 0 };
+  const result = { created: 0, updated: 0, unchanged: 0, closed: 0 };
   for (const item of plan) {
+    if (item.action === "close") {
+      await github(`/issues/${item.issueNumber}/comments`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ body: item.comment }) });
+      await github(`/issues/${item.issueNumber}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ state: "closed", state_reason: "completed" }) });
+      result.closed += 1;
+      continue;
+    }
     if (item.action === "create") {
       await github("/issues", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ title: item.title, body: item.body, labels: item.labels }) });
       result.created += 1;

@@ -1,6 +1,9 @@
 // Deterministic, side-effect-free policy and Issue planning for official-source
 // re-checks. Network and GitHub API calls live in separate scripts.
 
+import { urlFinding } from "./source-recheck-state.mjs";
+import { encodeIssuePayload } from "./source-recheck-payload.mjs";
+
 export const STALE_AFTER_DAYS = 90;
 export const REQUEST_TIMEOUT_MS = 12_000;
 export const MAX_REDIRECTS = 5;
@@ -112,14 +115,17 @@ export function isPrivateAddress(value = "") {
 }
 
 export function classifyHttpStatus(status) {
-  if (Number.isInteger(status) && status >= 200 && status <= 399) return "healthy";
+  if (Number.isInteger(status) && status >= 200 && status < 300) return "healthy";
   if (status === 401 || status === 403) return "restricted";
   if (HARD_BROKEN.has(status)) return "hard-broken";
+  if (status === 429) return "rate-limited";
+  if (status >= 500 && status < 600) return "server-error";
   return "inconclusive";
 }
 
 export function isRedirectStatus(status) { return REDIRECT_STATUSES.has(status); }
 
+// Legacy helper retained for compatibility; never used to confirm production checks.
 export function classifyAttemptPair(first = {}, second = null) {
   if (first.classification === "unsafe" || second?.classification === "unsafe") return "unsafe";
   if (first.classification !== "hard-broken") return first.classification || "inconclusive";
@@ -149,8 +155,12 @@ export function verificationFinding(lastVerifiedAt, now = new Date(), staleAfter
 export function actionableFindingsForTool(toolResult = {}, now = new Date(), staleAfterDays = STALE_AFTER_DAYS) {
   const findings = [];
   const verification = verificationFinding(toolResult.lastVerifiedAt, now, staleAfterDays);
-  if (verification) findings.push(verification);
+  if (verification) findings.push({ ...verification, toolId: toolResult.id, findingId: `${toolResult.id}:verification`, repairEligible: false });
   for (const check of Array.isArray(toolResult.checks) ? toolResult.checks : []) {
+    if (check.state) {
+      if (["confirmed-broken", "unsafe"].includes(check.state.phase)) findings.push(urlFinding(toolResult.id, check));
+      continue;
+    }
     if (check?.classification !== "broken" && check?.classification !== "unsafe") continue;
     findings.push({
       type: "url",
@@ -193,8 +203,13 @@ export function sourceRecheckIssueBody(toolResult = {}) {
       const message = finding.code === "stale" ? `Verification is older than ${STALE_AFTER_DAYS} days.` : finding.message;
       lines.push(`- ${message}`);
     }
-    else if (finding.code === "broken") lines.push(`- ${markdownText((finding.kinds || []).join(", ") || "source")} — ${markdownCode(finding.url)} returned ${finding.status ?? "404/410"} twice.`);
+    else if (finding.code === "broken") lines.push(`- ${markdownText((finding.kinds || []).join(", ") || "source")} — ${markdownCode(finding.url)} has confirmed 404/410 observations from separate scheduled runs (latest status: ${finding.status ?? "unknown"}).`);
     else lines.push(`- ${markdownText((finding.kinds || []).join(", ") || "source")} — ${markdownCode(finding.url)} is blocked by safe-network policy${finding.reason ? ` (${markdownText(finding.reason)})` : ""}.`);
+  }
+  const uncertain = (toolResult.checks || []).filter(check => check.state && !["healthy", "redirect"].includes(check.classification) && !["confirmed-broken", "unsafe"].includes(check.state.phase));
+  if (uncertain.length) {
+    lines.push("", "### Unconfirmed observations", "", "These observations are not proof of recovery or confirmed broken links; historical findings may still need review.");
+    for (const check of uncertain) lines.push(`- ${markdownCode(check.originalUrl)}: ${markdownText(check.classification)} (${check.finalStatus ?? "no HTTP response"}).`);
   }
   lines.push(
     "",
@@ -204,22 +219,31 @@ export function sourceRecheckIssueBody(toolResult = {}) {
     "",
     "A maintainer should inspect the official source, verify factual metadata through the normal trusted path, then close this Issue when satisfied.",
     "",
-    sourceRecheckMarker(tool.id)
+    sourceRecheckMarker(tool.id),
+    "",
+    encodeIssuePayload(tool.id, findings)
   );
-  return lines.join("\n");
+  const body = lines.join("\n");
+  if (Buffer.byteLength(body) > 60_000) throw new Error(`Source-recheck Issue for ${tool.id} exceeds the safe body size.`);
+  return body;
 }
 
 export function planSourceRecheckIssues(report = {}, openIssues = []) {
   const issues = Array.isArray(openIssues) ? openIssues : [];
   return (Array.isArray(report.tools) ? report.tools : [])
-    .filter((tool) => Array.isArray(tool.actionable) && tool.actionable.length)
+    .filter((tool) => Array.isArray(tool.actionable))
     .slice()
     .sort((a, b) => cleanText(a.id).localeCompare(cleanText(b.id)))
-    .map((tool) => {
+    .flatMap((tool) => {
       const title = sourceRecheckIssueTitle(tool);
       const marker = sourceRecheckMarker(tool.id);
       const body = sourceRecheckIssueBody(tool);
-      const existing = issues.find((issue) => issue?.state === "open" && (String(issue.body || "").includes(marker) || String(issue.title || "") === title));
+      const matches = issues.filter((issue) => !issue.pull_request && issue?.state === "open" && String(issue.body || "").split(/\r?\n/).includes(marker)).sort((a, b) => a.number - b.number);
+      const existing = matches[0];
+      if (!tool.actionable.length) {
+        if (tool.safeToClose !== true) return [];
+        return matches.map((issue) => ({ action: "close", toolId: tool.id, issueNumber: issue.number, comment: "Automatic re-check: all tracked findings are resolved or removed from the catalog. HTTP reachability is not factual verification." }));
+      }
       const requiredLabels = [SOURCE_RECHECK_LABEL, NEEDS_REVIEW_LABEL];
       if (!existing) return { action: "create", toolId: tool.id, title, body, labels: requiredLabels };
       const labels = new Set((Array.isArray(existing.labels) ? existing.labels : []).map((label) => typeof label === "string" ? label : label?.name).filter(Boolean));
@@ -242,7 +266,14 @@ export function formatSourceRecheckSummary(report = {}, issueResult = {}) {
     `| Tools checked | ${report.toolsChecked || 0} |`,
     `| URLs checked | ${report.urlsChecked || 0} |`,
     `| Reachable | ${summary.healthy || 0} |`,
+    `| Redirects | ${summary.redirect || 0} |`,
+    `| Suspects | ${summary.suspect || 0} |`,
     `| Restricted | ${summary.restricted || 0} |`,
+    `| Rate limited | ${summary["rate-limited"] || 0} |`,
+    `| Timeouts | ${summary.timeout || 0} |`,
+    `| DNS failures | ${summary.dns || 0} |`,
+    `| Network/TLS failures | ${summary["network-tls"] || 0} |`,
+    `| Server errors | ${summary["server-error"] || 0} |`,
     `| Broken | ${summary.broken || 0} |`,
     `| Inconclusive | ${summary.inconclusive || 0} |`,
     `| Unsafe | ${summary.unsafe || 0} |`,
@@ -250,6 +281,7 @@ export function formatSourceRecheckSummary(report = {}, issueResult = {}) {
     `| Maintenance Issues created | ${issues.created || 0} |`,
     `| Maintenance Issues updated | ${issues.updated || 0} |`,
     `| Maintenance Issues unchanged | ${issues.unchanged || 0} |`,
+    `| Maintenance Issues closed | ${issues.closed || 0} |`,
     "",
     "HTTP reachability never refreshes `lastVerifiedAt` and this workflow never edits catalog data."
   ].join("\n");
